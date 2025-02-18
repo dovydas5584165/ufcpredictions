@@ -29,14 +29,19 @@ except (FileNotFoundError, EOFError):
     df['height_diff'] = df['r_height'] - df['b_height']
     df['weight_diff'] = df['r_weight'] - df['b_weight']
     df['rev_diff'] = df['r_rev'] - df['b_rev']
-    df['sig_str_diff'] = df['r_sig_str_acc'] - df['b_sig_str_acc']
-    df['td_def_diff'] = df['r_td_def_total'] - df['b_td_def_total']
+    df['sig_str_acc_diff'] = df['r_sig_str_acc'] - df['b_sig_str_acc']
+    df['td_acc_diff'] = df['r_td_acc'] - df['b_td_acc']
+    
+    # Calculate submission accuracy (avoid division by zero)
+    df['r_sub_acc'] = np.where(df['r_sub_att'] > 0, df['r_sub_avg'] / df['r_sub_att'], 0)
+    df['b_sub_acc'] = np.where(df['b_sub_att'] > 0, df['b_sub_avg'] / df['b_sub_att'], 0)
+    df['sub_acc_diff'] = df['r_sub_acc'] - df['b_sub_acc']
     
     # Target encoding (1 = Red, 0 = Blue)
     df['target'] = df['winner'].map({'Red': 1, 'Blue': 0})
 
-    # Define features (Removed 'ctrl_sec_diff')
-    features = ['age_diff', 'height_diff', 'weight_diff', 'rev_diff', 'sig_str_diff', 'td_def_diff']
+    # Define features
+    features = ['age_diff', 'height_diff', 'weight_diff', 'rev_diff', 'sig_str_acc_diff', 'td_acc_diff', 'sub_acc_diff']
     X = df[features]
     y = df['target']
 
@@ -78,38 +83,6 @@ except (FileNotFoundError, EOFError):
     joblib.dump(scaler, 'scaler.pkl')
     joblib.dump(imputer, 'imputer.pkl')
     print("Model, scaler, and imputer saved successfully.")
-
-# Stats for Song Yadong (Red) and Henry Cejudo (Blue)
-song_yadong_stats = {
-    'r_age': 35, 'r_height': 5.8, 'r_weight': 66, 'r_rev': 10, 'r_sig_str_acc': 48, 'r_td_def_total': 15
-}
-
-henry_cejudo_stats = {
-    'b_age': 35, 'b_height': 5.4, 'b_weight': 61, 'b_rev': 15, 'b_sig_str_acc': 58, 'b_td_def_total': 10
-}
-
-# Combine the stats of both fighters
-fighter_data = pd.DataFrame([song_yadong_stats | henry_cejudo_stats])
-
-# Calculate feature differences (Removed 'ctrl_sec_diff')
-fighter_data['age_diff'] = fighter_data['r_age'] - fighter_data['b_age']
-fighter_data['height_diff'] = fighter_data['r_height'] - fighter_data['b_height']
-fighter_data['weight_diff'] = fighter_data['r_weight'] - fighter_data['b_weight']
-fighter_data['rev_diff'] = fighter_data['r_rev'] - fighter_data['b_rev']
-fighter_data['sig_str_diff'] = fighter_data['r_sig_str_acc'] - fighter_data['b_sig_str_acc']
-fighter_data['td_def_diff'] = fighter_data['r_td_def_total'] - fighter_data['b_td_def_total']
-
-# Prepare input for prediction
-fighter_input = fighter_data[features]
-fighter_input = imputer.transform(fighter_input)  # Handle missing values
-fighter_input = scaler.transform(fighter_input)  # Scale data
-
-# Predict probabilities (for Red and Blue fighter)
-probabilities = best_xgb.predict_proba(fighter_input)
-
-# Output probability of winning
-print(f'Probability of Red Fighter (Song Yadong) winning: {probabilities[0][1] * 100:.2f}%')
-print(f'Probability of Blue Fighter (Henry Cejudo) winning: {probabilities[0][0] * 100:.2f}%')
 
 # Model Predictions
 y_pred = best_xgb.predict(X_test)
