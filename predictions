@@ -1,113 +1,119 @@
+!pip install optuna
+!pip install imbalanced-learn
+
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
+import joblib
+import optuna
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
+from sklearn.impute import KNNImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import f1_score, classification_report
+from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-import joblib
-import seaborn as sns
-import matplotlib.pyplot as plt
 
 # Load data
-try:
-    best_xgb = joblib.load('best_xgb_model.pkl')
-    scaler = joblib.load('scaler.pkl')
-    imputer = joblib.load('imputer.pkl')
-    print("Model, scaler, and imputer loaded successfully.")
-except (FileNotFoundError, EOFError):
-    print("Training the model as no saved files were found.")
+df = pd.read_csv('large_dataset.csv').dropna(subset=['winner'])
 
-    df = pd.read_csv('large_dataset.csv')
+# Undersampling to balance the classes
+rus = RandomUnderSampler(random_state=42)
+df_balanced, _ = rus.fit_resample(df, df['winner'])  # Apply undersampling
 
-    # Drop rows with missing target values
-    df = df.dropna(subset=['winner'])
+# Feature Engineering (Vectorized)
+df_balanced = df_balanced.assign(
+    age_diff=df_balanced['r_age'] - df_balanced['b_age'],
+    reach_diff=df_balanced['r_reach'] - df_balanced['b_reach'],
+    rev_diff=df_balanced['r_rev'] - df_balanced['b_rev'],
+    sig_str_acc_diff=df_balanced['r_sig_str_acc'] - df_balanced['b_sig_str_acc'],
+    td_acc_diff=df_balanced['r_td_acc'] - df_balanced['b_td_acc'],
+    sub_attempt_diff=df_balanced['r_sub_att'] - df_balanced['b_sub_att'],
+    target=df_balanced['winner'].map({'Red': 1, 'Blue': 0})
+)
 
-    # Feature engineering: differences between fighters' stats
-    df['age_diff'] = df['r_age'] - df['b_age']
-    df['height_diff'] = df['r_height'] - df['b_height']
-    df['weight_diff'] = df['r_weight'] - df['b_weight']
-    df['rev_diff'] = df['r_rev'] - df['b_rev']
-    df['sig_str_acc_diff'] = df['r_sig_str_acc'] - df['b_sig_str_acc']
-    df['td_acc_diff'] = df['r_td_acc'] - df['b_td_acc']
-    
-    # Calculate submission accuracy (avoid division by zero)
-    df['r_sub_acc'] = np.where(df['r_sub_att'] > 0, df['r_sub_avg'] / df['r_sub_att'], 0)
-    df['b_sub_acc'] = np.where(df['b_sub_att'] > 0, df['b_sub_avg'] / df['b_sub_att'], 0)
-    df['sub_acc_diff'] = df['r_sub_acc'] - df['b_sub_acc']
-    
-    # Target encoding (1 = Red, 0 = Blue)
-    df['target'] = df['winner'].map({'Red': 1, 'Blue': 0})
+features = ['reach_diff', 'age_diff', 'rev_diff', 'sig_str_acc_diff', 'td_acc_diff', 'sub_attempt_diff']
 
-    # Define features
-    features = ['age_diff', 'height_diff', 'weight_diff', 'rev_diff', 'sig_str_acc_diff', 'td_acc_diff', 'sub_acc_diff']
-    X = df[features]
-    y = df['target']
-
-    # Train-test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-    # Handle missing values
-    imputer = SimpleImputer(strategy='mean')
-    X_train = imputer.fit_transform(X_train)
-    X_test = imputer.transform(X_test)
-
-    # Balance the dataset with SMOTE
-    smote = SMOTE(random_state=42)
-    X_train, y_train = smote.fit_resample(X_train, y_train)
-
-    # Feature scaling
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    # XGBoost hyperparameter tuning
-    param_grid = {
-        'n_estimators': [100, 200, 300],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'subsample': [0.8, 1.0],
-        'colsample_bytree': [0.8, 1.0]
+# Data Splitting
+def split_data(df):
+    return {
+        'Women': df[df['gender'] == 'Women'],
+        'Tiny': df.query("r_weight < 80 & b_weight < 80"),
+        'Big Guy': df.query("r_weight >= 80 & b_weight >= 80")
     }
 
-    xgb = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42)
-    grid_search = GridSearchCV(xgb, param_grid, cv=5, scoring='accuracy', n_jobs=-1)
-    grid_search.fit(X_train, y_train)
+splits = split_data(df_balanced)
+models = {}
 
-    # Best model
-    best_xgb = grid_search.best_estimator_
+# Optuna Objective Function
+def objective(trial, X, y):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    f1_scores = []
 
-    # Save the model, scaler, and imputer
-    joblib.dump(best_xgb, 'best_xgb_model.pkl')
-    joblib.dump(scaler, 'scaler.pkl')
-    joblib.dump(imputer, 'imputer.pkl')
-    print("Model, scaler, and imputer saved successfully.")
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 400),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 1.0),
+        'random_state': 42,
+        'eval_metric': 'logloss'
+    }
 
-# Model Predictions
-y_pred = best_xgb.predict(X_test)
+    for train_idx, val_idx in skf.split(X, y):
+        model = XGBClassifier(**params)
+        model.fit(X[train_idx], y[train_idx])
+        f1_scores.append(f1_score(y[val_idx], model.predict(X[val_idx])))
 
-# Accuracy Score
-accuracy = accuracy_score(y_test, y_pred)
-print(f"Model Accuracy: {accuracy * 100:.2f}%")
+    return np.mean(f1_scores)
 
-# Get feature importance
-feature_importance = best_xgb.feature_importances_
+# Model Training Function
+def train_model(group, df_group):
+    if len(df_group) < 5:
+        print(f"Skipping {group} due to low sample size.")
+        return
 
-# Create a DataFrame for better visualization
-feature_importance_df = pd.DataFrame({
-    'Feature': features,
-    'Importance': feature_importance
-}).sort_values(by='Importance', ascending=False)
+    print(f"Training model for {group}...")
 
-# Print feature importance
-print("Feature Contributions:")
-print(feature_importance_df)
+    X, y = df_group[features].values, df_group['target'].values
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
-# Plot feature importance
-plt.figure(figsize=(10, 5))
-sns.barplot(x='Importance', y='Feature', data=feature_importance_df, palette="viridis")
-plt.title("Feature Importance (XGBoost)")
-plt.xlabel("Importance Score")
-plt.ylabel("Feature")
-plt.show()
+    # Imputation (Precompute for Efficiency)
+    imputer = KNNImputer(n_neighbors=5).fit(X_train)
+    X_train, X_test = imputer.transform(X_train), imputer.transform(X_test)
+
+    # Balance Data Using SMOTE
+    X_train, y_train = SMOTE(random_state=42).fit_resample(X_train, y_train)
+
+    # Hyperparameter Optimization (Parallel Execution)
+    study = optuna.create_study(direction='maximize')
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=30, n_jobs=-1)
+
+    best_params = study.best_params
+    print(f"Best Params for {group}: {best_params}")
+
+    # Train Final Model with Optimized Parameters
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', XGBClassifier(**best_params, random_state=42, eval_metric='logloss'))
+    ])
+
+    pipeline.fit(X_train, y_train)
+    models[group] = pipeline
+
+    # Save pipeline and imputer
+    joblib.dump(pipeline, f'model_pipeline_{group}.pkl')
+    joblib.dump(imputer, f'imputer_{group}.pkl')
+
+    # Evaluation
+    y_pred = pipeline.predict(X_test)
+    print(f"F1 Score for {group}: {f1_score(y_test, y_pred):.4f}")
+    print(classification_report(y_test, y_pred))
+
+# Train Models for Each Group
+for group, df_group in splits.items():
+    train_model(group, df_group)
+
+print("Models trained and saved successfully.")
