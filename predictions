@@ -1,55 +1,116 @@
-!pip install optuna
-!pip install imbalanced-learn
+# ==========================================
+# 1. SETUP & CONFIGURATION
+# ==========================================
+# Try to install necessary libraries if not present (uncomment if running in a fresh environment)
+# !pip install optuna imbalanced-learn xgboost scikit-learn pandas numpy
 
 import pandas as pd
 import numpy as np
 import joblib
 import optuna
+import logging
+import sys
+
+# Scikit-Learn & Imblearn modules
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import KNNImputer
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import f1_score, classification_report
+from imblearn.pipeline import Pipeline as ImbPipeline  # Critical for using SMOTE in pipelines
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 
-# Load data
-df = pd.read_csv('large_dataset.csv').dropna(subset=['winner'])
+# Configure logging to print to standard output
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Undersampling to balance the classes
-rus = RandomUnderSampler(random_state=42)
-df_balanced, _ = rus.fit_resample(df, df['winner'])  # Apply undersampling
+# Configuration Constants
+DATA_PATH = 'large_dataset.csv'
+RANDOM_STATE = 42
+TARGET_COL = 'winner'
+FEATURES = [
+    'reach_diff', 'age_diff', 'rev_diff', 
+    'sig_str_acc_diff', 'td_acc_diff', 'sub_attempt_diff'
+]
 
-# Feature Engineering (Vectorized)
-df_balanced = df_balanced.assign(
-    age_diff=df_balanced['r_age'] - df_balanced['b_age'],
-    reach_diff=df_balanced['r_reach'] - df_balanced['b_reach'],
-    rev_diff=df_balanced['r_rev'] - df_balanced['b_rev'],
-    sig_str_acc_diff=df_balanced['r_sig_str_acc'] - df_balanced['b_sig_str_acc'],
-    td_acc_diff=df_balanced['r_td_acc'] - df_balanced['b_td_acc'],
-    sub_attempt_diff=df_balanced['r_sub_att'] - df_balanced['b_sub_att'],
-    target=df_balanced['winner'].map({'Red': 1, 'Blue': 0})
-)
+# ==========================================
+# 2. DATA PROCESSING FUNCTIONS
+# ==========================================
 
-features = ['reach_diff', 'age_diff', 'rev_diff', 'sig_str_acc_diff', 'td_acc_diff', 'sub_attempt_diff']
+def load_and_preprocess_data(filepath: str) -> pd.DataFrame:
+    """
+    Loads raw data, performs initial cleaning, undersampling, and feature engineering.
+    
+    Rationale:
+    - We drop missing targets immediately as they are useless for training.
+    - We apply RandomUnderSampler early to handle extreme class imbalance if present,
+      ensuring the dataset is manageable before expensive feature engineering.
+    """
+    logging.info(f"Loading data from {filepath}...")
+    try:
+        df = pd.read_csv(filepath)
+    except FileNotFoundError:
+        logging.error(f"File {filepath} not found. Please check the path.")
+        sys.exit(1)
 
-# Data Splitting
-def split_data(df):
+    # Drop rows where we don't know the winner
+    df = df.dropna(subset=[TARGET_COL])
+
+    # Balance the dataset classes initially using Undersampling
+    # This reduces the size of the majority class to match the minority class.
+    logging.info("Applying Random Undersampling to balance classes...")
+    rus = RandomUnderSampler(random_state=RANDOM_STATE)
+    df_balanced, _ = rus.fit_resample(df, df[TARGET_COL])
+
+    # Feature Engineering: Calculate differences between Red (r) and Blue (b) fighters
+    # Vectorized operations are used here for speed.
+    logging.info("Engineering 'difference' features...")
+    df_balanced = df_balanced.assign(
+        age_diff=df_balanced['r_age'] - df_balanced['b_age'],
+        reach_diff=df_balanced['r_reach'] - df_balanced['b_reach'],
+        rev_diff=df_balanced['r_rev'] - df_balanced['b_rev'],
+        sig_str_acc_diff=df_balanced['r_sig_str_acc'] - df_balanced['b_sig_str_acc'],
+        td_acc_diff=df_balanced['r_td_acc'] - df_balanced['b_td_acc'],
+        sub_attempt_diff=df_balanced['r_sub_att'] - df_balanced['b_sub_att'],
+        # Encode Target: Red = 1, Blue = 0
+        target=df_balanced[TARGET_COL].map({'Red': 1, 'Blue': 0})
+    )
+    
+    return df_balanced
+
+def segment_data(df: pd.DataFrame) -> dict:
+    """
+    Splits the dataframe into logical segments (cohorts) for specialized modeling.
+    
+    Segments:
+    1. Women: Female fighters.
+    2. Tiny: Lightweight fighters (< 80).
+    3. Big Guy: Heavyweight fighters (>= 80).
+    """
+    logging.info("Segmenting data into cohorts (Women, Tiny, Big Guy)...")
     return {
         'Women': df[df['gender'] == 'Women'],
         'Tiny': df.query("r_weight < 80 & b_weight < 80"),
         'Big Guy': df.query("r_weight >= 80 & b_weight >= 80")
     }
 
-splits = split_data(df_balanced)
-models = {}
+# ==========================================
+# 3. OPTIMIZATION & TRAINING ENGINE
+# ==========================================
 
-# Optuna Objective Function
 def objective(trial, X, y):
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    f1_scores = []
-
+    """
+    Optuna Objective Function.
+    
+    This function trains an XGBoost model using cross-validation for a specific
+    set of hyperparameters suggested by Optuna.
+    
+    CRITICAL CHANGE: 
+    We use an imblearn Pipeline inside the CV loop. This ensures SMOTE is applied
+    ONLY to the training folds, not the validation folds. This prevents data leakage
+    and provides a realistic performance estimate.
+    """
+    # Define hyperparameter search space
     params = {
         'n_estimators': trial.suggest_int('n_estimators', 100, 400),
         'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -58,62 +119,114 @@ def objective(trial, X, y):
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
         'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
         'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 1.0),
-        'random_state': 42,
-        'eval_metric': 'logloss'
+        'random_state': RANDOM_STATE,
+        'eval_metric': 'logloss',
+        'n_jobs': 1 # XGBoost parallelization handled by Optuna
     }
 
-    for train_idx, val_idx in skf.split(X, y):
-        model = XGBClassifier(**params)
-        model.fit(X[train_idx], y[train_idx])
-        f1_scores.append(f1_score(y[val_idx], model.predict(X[val_idx])))
+    # Pipeline: SMOTE -> Scaler -> Classifier
+    # Note: SMOTE is only applied during fit(), not predict(), ensuring valid validation.
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=RANDOM_STATE)),
+        ('scaler', StandardScaler()),
+        ('model', XGBClassifier(**params))
+    ])
+
+    # Stratified K-Fold ensures each fold has the same percentage of samples for each class
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    
+    f1_scores = []
+    
+    # Manual CV loop to capture scores
+    for train_idx, val_idx in cv.split(X, y):
+        X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+        y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+        
+        pipeline.fit(X_train_fold, y_train_fold)
+        preds = pipeline.predict(X_val_fold)
+        f1_scores.append(f1_score(y_val_fold, preds))
 
     return np.mean(f1_scores)
 
-# Model Training Function
-def train_model(group, df_group):
-    if len(df_group) < 5:
-        print(f"Skipping {group} due to low sample size.")
+def train_segment_model(group_name: str, df_group: pd.DataFrame):
+    """
+    Orchestrates the training process for a specific data segment.
+    1. Imputes missing data.
+    2. Optimizes hyperparameters.
+    3. Trains final model.
+    4. Saves artifacts.
+    """
+    if len(df_group) < 50: # Increased threshold for safety
+        logging.warning(f"Skipping group '{group_name}': Insufficient data points ({len(df_group)}).")
         return
 
-    print(f"Training model for {group}...")
+    logging.info(f"--- Starting Process for Group: {group_name} ---")
 
-    X, y = df_group[features].values, df_group['target'].values
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    X = df_group[FEATURES].values
+    y = df_group['target'].values
 
-    # Imputation (Precompute for Efficiency)
-    imputer = KNNImputer(n_neighbors=5).fit(X_train)
-    X_train, X_test = imputer.transform(X_train), imputer.transform(X_test)
+    # Split: 80% Train, 20% Test
+    # Stratify ensures the distribution of classes (Red/Blue winners) is the same in train and test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
 
-    # Balance Data Using SMOTE
-    X_train, y_train = SMOTE(random_state=42).fit_resample(X_train, y_train)
+    # Step 1: Imputation
+    # We fit the imputer on Training data only to avoid leakage, then transform Test data.
+    logging.info(f"[{group_name}] Imputing missing values using KNN...")
+    imputer = KNNImputer(n_neighbors=5)
+    X_train = imputer.fit_transform(X_train)
+    X_test = imputer.transform(X_test)
 
-    # Hyperparameter Optimization (Parallel Execution)
+    # Step 2: Hyperparameter Optimization
+    logging.info(f"[{group_name}] optimizing hyperparameters with Optuna...")
     study = optuna.create_study(direction='maximize')
+    # Use partial function or lambda to pass X_train and y_train
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=30, n_jobs=-1)
 
     best_params = study.best_params
-    print(f"Best Params for {group}: {best_params}")
+    logging.info(f"[{group_name}] Best Parameters found: {best_params}")
 
-    # Train Final Model with Optimized Parameters
-    pipeline = Pipeline([
+    # Step 3: Final Model Training
+    # We construct the final production pipeline.
+    # Note: We include SMOTE here so the final model is trained on balanced data.
+    final_pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=RANDOM_STATE)),
         ('scaler', StandardScaler()),
-        ('model', XGBClassifier(**best_params, random_state=42, eval_metric='logloss'))
+        ('model', XGBClassifier(**best_params, random_state=RANDOM_STATE, eval_metric='logloss'))
     ])
 
-    pipeline.fit(X_train, y_train)
-    models[group] = pipeline
+    logging.info(f"[{group_name}] Training final model...")
+    final_pipeline.fit(X_train, y_train)
 
-    # Save pipeline and imputer
-    joblib.dump(pipeline, f'model_pipeline_{group}.pkl')
-    joblib.dump(imputer, f'imputer_{group}.pkl')
+    # Step 4: Save Artifacts
+    # It is best practice to save the Imputer separately or include it in the pipeline. 
+    # Here we save both for flexibility.
+    joblib.dump(final_pipeline, f'model_pipeline_{group_name}.pkl')
+    joblib.dump(imputer, f'imputer_{group_name}.pkl')
+    logging.info(f"[{group_name}] Models saved to disk.")
 
-    # Evaluation
-    y_pred = pipeline.predict(X_test)
-    print(f"F1 Score for {group}: {f1_score(y_test, y_pred):.4f}")
+    # Step 5: Evaluation
+    y_pred = final_pipeline.predict(X_test)
+    score = f1_score(y_test, y_pred)
+    
+    print(f"\n=== Classification Report for {group_name} ===")
+    print(f"Test F1 Score: {score:.4f}")
     print(classification_report(y_test, y_pred))
+    print("="*40 + "\n")
 
-# Train Models for Each Group
-for group, df_group in splits.items():
-    train_model(group, df_group)
-
-print("Models trained and saved successfully.")
+# ==========================================
+# 4. MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    # Load Data
+    df_processed = load_and_preprocess_data(DATA_PATH)
+    
+    # Create Segments
+    data_segments = segment_data(df_processed)
+    
+    # Iterate and Train
+    for group_name, df_segment in data_segments.items():
+        train_segment_model(group_name, df_segment)
+        
+    logging.info("All training tasks completed successfully.")
