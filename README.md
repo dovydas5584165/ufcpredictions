@@ -24,19 +24,3 @@ Optimization: Optuna searches for optimal parameters while preventing leakage by
 
 Evaluation: Final testing on a hold-out set (20% of data).
 
-├── data/
-│   └── large_dataset.csv       # Historical fight data
-├── artifacts/
-│   ├── model_pipeline_BigGuy.pkl  # Trained Model (Heavyweights)
-│   ├── model_pipeline_Women.pkl   # Trained Model (Women's divisions)
-│   └── imputer_Tiny.pkl           # KNN Imputer for Lightweights
-├── src/
-│   ├── feature_engineering.py  # Logic for "Heart" & "Chin" metrics
-│   └── train_model.py          # Main training loop
-├── README.md
-└── requirements.txt
-
-Cohort,F1-Score,Precision,Recall,Support
-Overall,0.76,0.77,0.75,1450
-Women,0.72,0.73,0.71,320
-Heavyweight,0.79,0.81,0.78,210
