@@ -1,0 +1,6 @@
+data/cache/
+models/
+*.pkl
+__pycache__/
+.pytest_cache/
+bouts_features.csv
